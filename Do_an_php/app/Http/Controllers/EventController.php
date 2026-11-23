@@ -2,34 +2,27 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\TicketCountsChanged;
 use App\Models\DangKy;
 use App\Models\SuKien;
 use App\Models\YeuThich;
-use App\Http\Requests\StoreEventRequest;
-use App\Http\Requests\UpdateEventRequest;
+use App\Http\Requests\EventRequest;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 class EventController extends Controller
 {
     protected function getCurrentUser()
     {
-        return Auth::user() ?? session('user');
+        return Auth::user();
     }
-    /**
-     * Form tạo mới sự kiện (Resource create)
-     */
-    public function create()
-    {
-        //
-    }
-
     /**
      * Lưu sự kiện mới vào CSDL (Resource store)
      */
-    public function store(StoreEventRequest $request)
+    public function store(EventRequest $request)
     {
         $user = $this->getCurrentUser();
         if (!$user || $user->vai_tro !== 'admin') {
@@ -44,7 +37,7 @@ class EventController extends Controller
 
         SuKien::create($data);
 
-        return redirect()->route('Admin.index', ['tab' => 'events'])
+        return redirect()->route('admin.index', ['tab' => 'events'])
             ->with('success', 'Đã tạo sự kiện mới.');
     }
 
@@ -55,6 +48,8 @@ class EventController extends Controller
     {
         $event = SuKien::with(['danhMuc', 'nguoiTao', 'dangKys'])->findOrFail($id);
         $user = $this->getCurrentUser();
+
+        abort_if($event->trang_thai !== 'cong_khai' && $user?->vai_tro !== 'admin', 404);
 
         $isFavorited = false;
         $userTicket = null;
@@ -69,21 +64,13 @@ class EventController extends Controller
                 ->first();
         }
 
-        return view('home.event_detail', compact('event', 'user', 'isFavorited', 'userTicket'));
-    }
-
-    /**
-     * Form chỉnh sửa sự kiện (Resource edit)
-     */
-    public function edit($id)
-    {
-        //
+        return view('user.event_detail', compact('event', 'user', 'isFavorited', 'userTicket'));
     }
 
     /**
      * Cập nhật thông tin sự kiện (Resource update)
      */
-    public function update(UpdateEventRequest $request, $id)
+    public function update(EventRequest $request, $id)
     {
         $user = $this->getCurrentUser();
         if (!$user || $user->vai_tro !== 'admin') {
@@ -100,7 +87,7 @@ class EventController extends Controller
 
         $event->update($data);
 
-        return redirect()->route('Admin.index', ['tab' => 'events'])
+        return redirect()->route('admin.index', ['tab' => 'events'])
             ->with('success', 'Đã cập nhật sự kiện.');
     }
 
@@ -116,9 +103,13 @@ class EventController extends Controller
 
         $event = SuKien::findOrFail($id);
         $hasRegistrations = $event->dangKys()->exists();
-        $event->delete();
+        if ($hasRegistrations) {
+            $event->update(['trang_thai' => 'da_huy']);
+        } else {
+            $event->delete();
+        }
 
-        return redirect()->route('Admin.index', ['tab' => 'events'])->with(
+        return redirect()->route('admin.index', ['tab' => 'events'])->with(
             $hasRegistrations ? 'warning' : 'success',
             $hasRegistrations
                 ? 'Sự kiện đã có người đăng ký nên không bị xóa; hệ thống đã chuyển sự kiện sang trạng thái đã hủy.'
@@ -136,7 +127,13 @@ class EventController extends Controller
             return redirect()->route('Auth.index')->with('warning', 'Vui lòng đăng nhập để đăng ký vé.');
         }
 
-        $event = SuKien::findOrFail($id);
+        if ($user->vai_tro === 'admin') {
+            return redirect()->route('admin.index')->with('warning', 'Tài khoản quản trị không thể đặt vé.');
+        }
+
+        return DB::transaction(function () use ($user, $id) {
+        // Khóa dòng sự kiện trên MySQL để hai yêu cầu đồng thời không vượt sức chứa.
+        $event = SuKien::whereKey($id)->lockForUpdate()->firstOrFail();
 
         // Kiểm tra sự kiện có bị hủy không
         if ($event->trang_thai === 'da_huy') {
@@ -162,26 +159,34 @@ class EventController extends Controller
                 $existingTicket->trang_thai = 'da_xac_nhan';
                 $existingTicket->thoi_gian_dang_ky = now();
                 $existingTicket->save();
+                event(TicketCountsChanged::forEvent($event));
 
-                return redirect()->route('Dashboard.myTicket')->with('success', 'Bạn đã kích hoạt lại vé thành công! Mã vé: ' . $existingTicket->ma_ve);
+                return redirect()->route('Dashboard.myTicket')
+                    ->with('success', 'Bạn đã kích hoạt lại vé thành công! Mã vé: ' . $existingTicket->ma_ve)
+                    ->with('new_ticket_code', $existingTicket->ma_ve);
             }
 
             return redirect()->route('Dashboard.myTicket')->with('warning', 'Bạn đã đăng ký vé cho sự kiện này rồi! Mã vé: ' . $existingTicket->ma_ve);
         }
 
-        // Tạo mã vé duy nhất
-        $maVe = 'QQQ-' . date('Y') . '-' . strtoupper(Str::random(6));
-
         $ticket = DangKy::create([
             'nguoi_dung_id' => $user->id,
             'su_kien_id' => $id,
-            'ma_ve' => $maVe,
+            'ma_ve' => 'TEMP-' . $user->id . '-' . $id,
             'thoi_gian_dang_ky' => now(),
             'trang_thai' => 'da_xac_nhan',
             'ghi_chu' => 'Đăng ký vé trực tuyến trên website',
         ]);
 
-        return redirect()->route('Dashboard.myTicket')->with('success', 'Chúc mừng! Đăng ký vé thành công! Mã vé của bạn là ' . $maVe);
+        // ID vé bảo đảm duy nhất; phần ngẫu nhiên khiến mã khó đoán khi quét QR.
+        $maVe = 'QQQ-' . date('Y') . '-' . $ticket->id . '-' . strtoupper(Str::random(12));
+        $ticket->update(['ma_ve' => $maVe]);
+        event(TicketCountsChanged::forEvent($event));
+
+        return redirect()->route('Dashboard.myTicket')
+            ->with('success', 'Chúc mừng! Đăng ký vé thành công! Mã vé của bạn là ' . $maVe)
+            ->with('new_ticket_code', $maVe);
+        });
     }
 
     /** Tạo slug không trùng để dùng cho URL và báo cáo. */
