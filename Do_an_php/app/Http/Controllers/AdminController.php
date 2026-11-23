@@ -4,7 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Events\TicketCheckedIn;
 use App\Events\TicketCountsChanged;
+use App\Http\Requests\UpdateUserRoleRequest;
+use App\Http\Requests\UpdateUserStatusRequest;
 use App\Models\DangKy;
+use App\Models\DanhGia;
 use App\Models\DanhMuc;
 use App\Models\NguoiDung;
 use App\Models\SuKien;
@@ -46,6 +49,39 @@ class AdminController extends Controller
         $events = $eventsQuery->orderByDesc('id')->paginate(10, ['*'], 'events_page')->withQueryString();
         $registrations = DangKy::with(['nguoiDung', 'suKien'])->orderByDesc('id')
             ->paginate(10, ['*'], 'registrations_page')->withQueryString();
+
+        // Nạp danh sách người dùng cho tab quản lý người dùng (tìm kiếm, lọc vai trò & trạng thái)
+        $usersQuery = NguoiDung::query()->withCount('dangKys');
+        $userSearch = trim((string) $request->query('user_search', ''));
+        if ($userSearch !== '') {
+            $usersQuery->where(function ($query) use ($userSearch) {
+                $query->where('ho_ten', 'like', '%' . $userSearch . '%')
+                    ->orWhere('email', 'like', '%' . $userSearch . '%')
+                    ->orWhere('so_dien_thoai', 'like', '%' . $userSearch . '%');
+            });
+        }
+        $userRole = trim((string) $request->query('user_role', ''));
+        if (in_array($userRole, ['user', 'admin'], true)) {
+            $usersQuery->where('vai_tro', $userRole);
+        }
+        $userStatus = trim((string) $request->query('user_status', ''));
+        if (in_array($userStatus, ['hoat_dong', 'bi_khoa'], true)) {
+            $usersQuery->where('trang_thai', $userStatus);
+        }
+        $users = $usersQuery->orderByDesc('id')->paginate(10, ['*'], 'users_page')->withQueryString();
+
+        // Nạp danh sách đánh giá cho tab quản lý đánh giá (lọc theo sự kiện và số sao)
+        $allEventsForFilter = SuKien::query()->orderByDesc('id')->get(['id', 'ten_su_kien']);
+        $reviewsQuery = DanhGia::with(['nguoiDung', 'suKien']);
+        $reviewEventId = $request->query('review_event');
+        if (!empty($reviewEventId) && ctype_digit((string) $reviewEventId)) {
+            $reviewsQuery->where('su_kien_id', (int) $reviewEventId);
+        }
+        $reviewRating = $request->query('review_rating');
+        if (!empty($reviewRating) && in_array((int) $reviewRating, [1, 2, 3, 4, 5], true)) {
+            $reviewsQuery->where('so_sao', (int) $reviewRating);
+        }
+        $reviews = $reviewsQuery->orderByDesc('id')->paginate(10, ['*'], 'reviews_page')->withQueryString();
         $uploadDir = public_path('uploads/su_kien');
         File::ensureDirectoryExists($uploadDir);
         $eventImages = collect(File::files($uploadDir))
@@ -82,6 +118,9 @@ class AdminController extends Controller
             'events',
             'registrations',
             'categories',
+            'users',
+            'reviews',
+            'allEventsForFilter',
             'allCategories',
             'eventImages',
             'categoryChart',
@@ -236,6 +275,92 @@ class AdminController extends Controller
             'checkedInTotal' => $checkedInTotal,
         ]);
         });
+    }
+
+    /**
+     * Khóa hoặc mở khóa tài khoản người dùng (giữ nguyên các vé đã đăng ký).
+     */
+    public function updateUserStatus(UpdateUserStatusRequest $request, $id)
+    {
+        if ($response = $this->requireAdmin()) {
+            return $response;
+        }
+
+        $target = NguoiDung::findOrFail($id);
+        $newStatus = $request->validated('trang_thai');
+
+        if ($target->id === Auth::id() && $newStatus === 'bi_khoa') {
+            return back()->with('warning', 'Bạn không thể tự khóa tài khoản của chính mình.');
+        }
+
+        if ($target->vai_tro === 'admin' && $target->trang_thai === 'hoat_dong' && $newStatus === 'bi_khoa') {
+            $otherActiveAdmins = NguoiDung::where('vai_tro', 'admin')
+                ->where('trang_thai', 'hoat_dong')
+                ->where('id', '!=', $target->id)
+                ->count();
+
+            if ($otherActiveAdmins === 0) {
+                return back()->with('warning', 'Không thể khóa quản trị viên cuối cùng đang hoạt động.');
+            }
+        }
+
+        $target->update(['trang_thai' => $newStatus]);
+
+        $message = $newStatus === 'bi_khoa'
+            ? 'Đã khóa tài khoản ' . $target->ho_ten . '.'
+            : 'Đã mở khóa tài khoản ' . $target->ho_ten . '.';
+
+        return back()->with('success', $message);
+    }
+
+    /**
+     * Đổi vai trò người dùng giữa thành viên (user) và quản trị viên (admin).
+     */
+    public function updateUserRole(UpdateUserRoleRequest $request, $id)
+    {
+        if ($response = $this->requireAdmin()) {
+            return $response;
+        }
+
+        $target = NguoiDung::findOrFail($id);
+        $newRole = $request->validated('vai_tro');
+
+        if ($target->id === Auth::id() && $newRole !== 'admin') {
+            return back()->with('warning', 'Bạn không thể tự hạ quyền tài khoản của chính mình.');
+        }
+
+        if ($target->vai_tro === 'admin' && $newRole === 'user') {
+            $otherActiveAdmins = NguoiDung::where('vai_tro', 'admin')
+                ->where('trang_thai', 'hoat_dong')
+                ->where('id', '!=', $target->id)
+                ->count();
+
+            if ($otherActiveAdmins === 0) {
+                return back()->with('warning', 'Không thể hạ quyền quản trị viên cuối cùng đang hoạt động.');
+            }
+        }
+
+        $target->update(['vai_tro' => $newRole]);
+
+        $roleLabel = $newRole === 'admin' ? 'Quản trị viên' : 'Thành viên';
+
+        return back()->with('success', 'Đã chuyển vai trò của ' . $target->ho_ten . ' thành ' . $roleLabel . '.');
+    }
+
+    /**
+     * Ẩn hoặc hiện lại đánh giá sự kiện (kiểm duyệt nội dung vi phạm).
+     */
+    public function toggleReviewVisibility($id)
+    {
+        if ($response = $this->requireAdmin()) {
+            return $response;
+        }
+
+        $review = DanhGia::findOrFail($id);
+        $newStatus = $review->trang_thai === 'hien' ? 'an' : 'hien';
+        $review->update(['trang_thai' => $newStatus]);
+
+        return back()->with('success', $newStatus === 'an' ? 'Đã ẩn đánh giá.' : 'Đã hiển thị lại đánh giá.');
     }
 
     private function requireAdmin()
